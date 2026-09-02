@@ -1,0 +1,26 @@
+# Only machine-specific, regenerable dependency/build output is ignored.
+# Generated data (data/, output/) IS committed so the repo can be browsed
+# without running anything.
+
+# Python virtualenv — recreate with: make setup
+.venv/
+__pycache__/
+*.pyc
+
+# Node modules / Angular build — recreate with: cd frontend && npm install
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+
+# Terraform provider downloads + state — recreate with: terraform init
+# (.terraform/ contains a ~650 MB binary; GitHub rejects files over 100 MB)
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/tfplan
+terraform/terraform.tfvars
+terraform/build/
+
+# OS
+.DS_Store

@@ -1,0 +1,234 @@
+name: deploy
+
+# Validates the pipeline on every push/PR, and deploys the infra + ETL code
+# on push to main. Deploy steps only run if AWS credentials are configured as
+# repo secrets (or an OIDC role) — otherwise the job stops after validation.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write   # for AWS OIDC role assumption
+
+env:
+  AWS_REGION: eu-central-1
+  TF_VERSION: 1.9.5
+  PLANT_ID: munich
+  ENVIRONMENT: dev
+
+jobs:
+  python-pipeline:
+    name: python pipeline (lint + end-to-end run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Run pipeline end-to-end
+        run: |
+          python generate_mock_data.py --seed 42
+          python etl.py --risk-threshold-hours 12
+          python visualize.py
+
+      - name: Sanity-check curated output
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("data/curated/deliveries_risk.csv")
+          assert len(df) == 500, f"expected 500 rows, got {len(df)}"
+          assert df["risk_level"].isin(
+              ["LOW", "ON_TIME", "MEDIUM", "HIGH", "LATE"]
+          ).all(), "unexpected risk_level value"
+          print("curated output OK:", df["risk_level"].value_counts().to_dict())
+          PY
+
+      - name: API smoke test
+        run: |
+          ./.venv/bin/pip --version >/dev/null 2>&1 || true
+          pip install -r api/requirements.txt
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from api.app import app
+          c = TestClient(app)
+          assert c.get("/api/health").json()["rows"] == 500
+          assert len(c.get("/api/risk-breakdown").json()) >= 1
+          assert len(c.get("/api/supplier-on-time").json()) == 5
+          assert len(c.get("/api/at-risk?limit=10").json()) <= 10
+          print("API OK")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: risk-report
+          path: output/risk_report.png
+
+  frontend:
+    name: angular dashboard (build)
+    runs-on: ubuntu-latest
+    needs: python-pipeline
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: frontend/dist/browser/
+
+      # ---- deploy to S3 + invalidate CloudFront (needs AWS creds, main only) ----
+      - name: Check for AWS credentials
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AWS_DEPLOY_ROLE_ARN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No AWS creds — build succeeded, skipping S3 sync."
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.creds.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync to S3 and invalidate CloudFront
+        if: steps.creds.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="jit-parts-${PLANT_ID}-${ENVIRONMENT}-dashboard-${ACCOUNT}"
+          API_URL=$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='jit-parts-${PLANT_ID}-${ENVIRONMENT}-api'].ApiEndpoint | [0]" --output text)
+          # bake the real API URL into the production bundle
+          grep -rl '__API_BASE_URL__' dist/browser | xargs -r sed -i "s|__API_BASE_URL__|${API_URL}|g"
+          aws s3 sync dist/browser "s3://${BUCKET}" --delete
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='jit-parts-${PLANT_ID}-${ENVIRONMENT} delay-risk dashboard'].Id | [0]" --output text)
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths '/*'
+
+  terraform:
+    name: terraform validate + plan
+    runs-on: ubuntu-latest
+    needs: python-pipeline
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format check
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init (no backend)
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate
+
+      # ---- everything below needs real AWS creds ----
+      - name: Check for AWS credentials
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AWS_DEPLOY_ROLE_ARN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No AWS_DEPLOY_ROLE_ARN secret set — skipping plan/apply. Validation passed."
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.creds.outputs.available == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Init (S3 backend)
+        if: steps.creds.outputs.available == 'true'
+        run: terraform init
+
+      - name: Plan
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          terraform plan -input=false -out=tfplan \
+            -var="aws_region=${AWS_REGION}" \
+            -var="plant_id=${PLANT_ID}" \
+            -var="environment=${ENVIRONMENT}"
+
+      - name: Apply
+        if: steps.creds.outputs.available == 'true' && github.ref == 'refs/heads/main'
+        run: terraform apply -input=false -auto-approve tfplan
+
+  package-etl:
+    name: package Glue ETL code
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package Glue script
+        run: |
+          mkdir -p dist
+          cp glue/glue_etl.py dist/
+          ( cd glue && zip -r ../dist/glue_etl_bundle.zip . )
+
+      - name: Check for AWS credentials
+        id: creds
+        run: |
+          if [ -n "${{ secrets.AWS_DEPLOY_ROLE_ARN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No AWS creds — skipping upload of Glue script to S3."
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.creds.outputs.available == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync Glue script to S3
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          BUCKET="jit-parts-${PLANT_ID}-${ENVIRONMENT}-data-$(aws sts get-caller-identity --query Account --output text)"
+          aws s3 cp glue/glue_etl.py "s3://${BUCKET}/scripts/glue_etl.py"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glue-etl-bundle
+          path: dist/

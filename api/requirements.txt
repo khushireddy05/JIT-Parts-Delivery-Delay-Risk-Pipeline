@@ -1,0 +1,9 @@
+# API runtime deps (kept separate from the pipeline's requirements.txt)
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+pandas>=2.0,<3.0
+mangum>=0.17,<1.0
+httpx>=0.27,<1.0   # for fastapi.testclient in CI
+
+# Only needed when RISK_DATA_BACKEND=athena (deployed on AWS); install separately:
+#   pip install "awswrangler>=3.7,<4.0"

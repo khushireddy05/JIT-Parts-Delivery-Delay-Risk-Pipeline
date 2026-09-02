@@ -1,0 +1,9 @@
+# Keep the lint surface small and deterministic for CI.
+target-version = "py39"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "E501",  # line length is handled by the formatter, not enforced hard
+]

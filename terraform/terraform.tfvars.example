@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and adjust per deployment.
+aws_region             = "eu-central-1"
+plant_id               = "munich"
+environment            = "dev"
+risk_threshold_hours   = 12
+glue_number_of_workers = 2
+
+tags = {
+  Owner      = "data-engineering"
+  CostCenter = "logistics-analytics"
+}
